@@ -307,19 +307,27 @@ func TestListServerVehiclePositionEndpoints_Head(t *testing.T) {
 	}
 }
 
-// TestConfiguredVehiclePositionURLs checks the configured set without a
-// database: only the given server's entries count, URLs are normalized, and
-// a feed with no vehicle-position URL adds nothing.
-func TestConfiguredVehiclePositionURLs(t *testing.T) {
+// TestConfiguredVehiclePositionSources checks the configured sets without a
+// database: only the given server's entries count, source keys use the full
+// URL (query string included) while normalized URLs are kept for legacy rows,
+// and a feed with no vehicle-position URL adds nothing.
+func TestConfiguredVehiclePositionSources(t *testing.T) {
 	servers := []models.ObaServer{
 		configuredServer("https://example.com/api?key=x", "https://feeds.example.com/a?key=y", ""),
 		configuredServer("https://example.com/api", "https://feeds.example.com/b"),
 		configuredServer("https://other.example.com", "https://feeds.example.com/c"),
 	}
-	got := configuredVehiclePositionURLs(servers, "https://example.com/api")
-	want := map[string]bool{"https://feeds.example.com/a": true, "https://feeds.example.com/b": true}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("configured = %v, want %v", got, want)
+	got := configuredVehiclePositionSources(servers, "https://example.com/api")
+	wantURLs := map[string]bool{"https://feeds.example.com/a": true, "https://feeds.example.com/b": true}
+	wantSources := map[string]bool{
+		models.FeedSourceKey("https://feeds.example.com/a?key=y"): true,
+		models.FeedSourceKey("https://feeds.example.com/b"):       true,
+	}
+	if !reflect.DeepEqual(got.urls, wantURLs) {
+		t.Errorf("configured URLs = %v, want %v", got.urls, wantURLs)
+	}
+	if !reflect.DeepEqual(got.sources, wantSources) {
+		t.Errorf("configured sources = %v, want %v", got.sources, wantSources)
 	}
 }
 

@@ -277,6 +277,7 @@ const listOpenVehicleAnomalyEpisodesForServer = `-- name: ListOpenVehicleAnomaly
 SELECT
     e.vehicle_anomaly_episode_id,
     t.anomaly_code,
+    ep.endpoint_id,
     ep.normalized_vehicle_position_url,
     ep.feed_source_key,
     v.external_vehicle_id,
@@ -306,6 +307,7 @@ WHERE srv.normalized_base_url = $1
 type ListOpenVehicleAnomalyEpisodesForServerRow struct {
 	VehicleAnomalyEpisodeID      int64
 	AnomalyCode                  string
+	EndpointID                   int64
 	NormalizedVehiclePositionUrl string
 	FeedSourceKey                *string
 	ExternalVehicleID            string
@@ -331,6 +333,7 @@ func (q *Queries) ListOpenVehicleAnomalyEpisodesForServer(ctx context.Context, n
 		if err := rows.Scan(
 			&i.VehicleAnomalyEpisodeID,
 			&i.AnomalyCode,
+			&i.EndpointID,
 			&i.NormalizedVehiclePositionUrl,
 			&i.FeedSourceKey,
 			&i.ExternalVehicleID,
@@ -341,6 +344,40 @@ func (q *Queries) ListOpenVehicleAnomalyEpisodesForServer(ctx context.Context, n
 			return nil, err
 		}
 		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listServerBaseURLsWithOpenVehicleAnomalies = `-- name: ListServerBaseURLsWithOpenVehicleAnomalies :many
+SELECT DISTINCT srv.normalized_base_url
+FROM vehicle_anomaly_episode e
+JOIN vehicle_entity v ON v.vehicle_entity_id = e.vehicle_entity_id
+JOIN vehicle_position_endpoint ep ON ep.endpoint_id = v.endpoint_id
+JOIN onebusaway_server srv ON srv.server_id = ep.server_id
+WHERE e.closing_response_id IS NULL
+ORDER BY srv.normalized_base_url
+`
+
+// Every server base URL that still has an open vehicle-anomaly episode,
+// including servers no longer in the configuration. Startup and config
+// refreshes use this to close episodes of servers Watchdog no longer has an
+// in-memory entry for.
+func (q *Queries) ListServerBaseURLsWithOpenVehicleAnomalies(ctx context.Context) ([]string, error) {
+	rows, err := q.db.Query(ctx, listServerBaseURLsWithOpenVehicleAnomalies)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var normalized_base_url string
+		if err := rows.Scan(&normalized_base_url); err != nil {
+			return nil, err
+		}
+		items = append(items, normalized_base_url)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -41,6 +42,21 @@ const vehicleAnomalyRuleLogicVersion int32 = 1
 // gtfsDateLayout is a GTFS date (YYYYMMDD), the form trip start dates are
 // compared and classified in.
 const gtfsDateLayout = "20060102"
+
+// legacySourcePrefix marks an endpoint that predates source-keyed endpoints.
+// Its stored URL has no query string, so its feed source is unknown. Keeping
+// the endpoint ID in the key keeps episodes of different legacy endpoints
+// apart, while sourceIsKnown keeps them from being closed as a departed feed
+// while their server is still configured.
+const legacySourcePrefix = "legacy:"
+
+func legacySource(endpointID int64) string {
+	return fmt.Sprintf("%s%d", legacySourcePrefix, endpointID)
+}
+
+func sourceIsKnown(source string) bool {
+	return source != "" && !strings.HasPrefix(source, legacySourcePrefix)
+}
 
 // vehicleFacts is what a vehicle's evidence row records beyond the rule
 // inputs.
@@ -330,6 +346,11 @@ func (h *HistoryService) loadOpenVehicleEpisodes(ctx context.Context, server mod
 		source := ""
 		if row.FeedSourceKey != nil {
 			source = *row.FeedSourceKey
+		} else {
+			// A pre-upgrade endpoint has no source: its normalized URL does
+			// not carry the query string. Use the endpoint ID so two legacy
+			// endpoints on one server do not collide in memory.
+			source = legacySource(row.EndpointID)
 		}
 		key := vehicleEpisodeKey{
 			source:    source,
@@ -909,28 +930,29 @@ type vehicleDeparture struct {
 // server or feed is no longer configured, and drops the memory of the servers
 // they were held under, so an episode cannot stay open until retention. It
 // serves configuration refreshes (app.OnConfigUpdated) and the startup
-// reconcile alike: a refresh closes the feeds that left, and a restart closes
-// the feeds of configured servers that were removed while Watchdog was down.
+// reconcile alike: both close feeds that left, and the startup pass also finds
+// servers that left while Watchdog was down by reading the open episodes from
+// the database. A failed close stays pending there and is retried by the next
+// call. Episodes of legacy endpoints with no known source are only closed when
+// their whole server is gone: a still-configured feed cannot be identified
+// from the stored URL, so it must not be blamed for their removal.
 // It returns whether any episode was closed.
 func (h *HistoryService) CloseOpenVehicleEpisodes(ctx context.Context, servers []models.ObaServer) bool {
 	if h == nil || h.pool == nil || h.vehicles == nil {
 		return false
 	}
-	// baseURL → the feed sources the current configuration still fetches, and
-	// the base URLs that are configured at all. A base URL no configured entry
-	// names any more has no sources, so its open episodes are all departures.
+	// base URL → the feed sources the current configuration still fetches.
+	// Every entry counts: a server-scoped entry fetches its feeds too, so its
+	// replaced feeds must close like any other entry's.
 	configured := make(map[string]map[string]struct{})
-	serverScoped := make(map[string]bool)
+	serverByURL := make(map[string]models.ObaServer)
 	for _, server := range servers {
 		baseURL := utils.SanitizeServerURL(server.ObaBaseURL)
 		if baseURL == "" {
 			continue
 		}
-		if server.IsServerScoped() {
-			// A server-scoped entry records every agency OBA reports, so no
-			// open episode of it can be attributed to a feed that left.
-			serverScoped[baseURL] = true
-			continue
+		if _, ok := serverByURL[baseURL]; !ok {
+			serverByURL[baseURL] = server
 		}
 		sources := configured[baseURL]
 		if sources == nil {
@@ -941,42 +963,51 @@ func (h *HistoryService) CloseOpenVehicleEpisodes(ctx context.Context, servers [
 			sources[models.FeedSourceKey(feed.VehiclePositionURL)] = struct{}{}
 		}
 	}
+
 	closed := false
+	// In-memory entries first: a config refresh closes feeds that left while
+	// Watchdog was running.
 	for _, baseURL := range h.vehicles.baseURLs() {
-		if serverScoped[baseURL] {
-			continue
-		}
-		keep := make(map[string]struct{})
-		if sources, ok := configured[baseURL]; ok {
-			keep = sources
-		}
 		entry, ok := h.vehicles.lookup(baseURL)
 		if !ok {
 			continue
 		}
-		if h.closeOpenVehicleEpisodes(ctx, entry, keep) {
+		sources, stillConfigured := configured[baseURL]
+		if h.closeOpenVehicleEpisodes(ctx, entry, sources, stillConfigured) {
 			closed = true
 		}
 	}
-	// Configured servers that this process has not polled yet (a restart) load
-	// their open episodes and close the feeds that left while Watchdog was down.
-	for _, server := range servers {
-		baseURL := utils.SanitizeServerURL(server.ObaBaseURL)
-		if baseURL == "" || server.IsServerScoped() {
-			continue
-		}
-		entry, ok := h.vehicles.lookup(baseURL)
+	// The in-memory registry is empty after a restart, and a server that left
+	// while Watchdog was down has no entry at all. Read the open episodes from
+	// the database so both are handled. This also retries a close that failed
+	// earlier; after a successful one there is nothing left to close.
+	baseURLs, err := dbgen.New(h.pool).ListServerBaseURLsWithOpenVehicleAnomalies(ctx)
+	if err != nil {
+		reportWriteFailure(h.logger, vehicleAnomalyLoadStep, writeTags{}, fmt.Errorf("list servers with open vehicle anomaly episodes: %w", err))
+		return closed
+	}
+	for _, baseURL := range baseURLs {
+		sources, stillConfigured := configured[baseURL]
+		server, ok := serverByURL[baseURL]
 		if !ok {
+			// The server left the configuration, so its display name is no
+			// longer available. The base URL identifies it well enough for a
+			// synthetic closing response and for the failure tags.
+			server = models.ObaServer{ObaBaseURL: baseURL, ServerName: baseURL}
+		}
+		entry, found := h.vehicles.lookup(baseURL)
+		if !found {
 			entry = h.vehicles.forServer(baseURL, server)
 		}
-		if !entry.loaded && !h.loadOpenVehicleEpisodes(ctx, server, baseURL, entry) {
+		// loadOpenVehicleEpisodes owns entry.open and entry.loaded, and
+		// RecordVehiclePositions takes the same lock for its own load.
+		entry.mu.Lock()
+		loaded := entry.loaded || h.loadOpenVehicleEpisodes(ctx, server, baseURL, entry)
+		entry.mu.Unlock()
+		if !loaded {
 			continue
 		}
-		keep := make(map[string]struct{})
-		if sources, ok := configured[baseURL]; ok {
-			keep = sources
-		}
-		if h.closeOpenVehicleEpisodes(ctx, entry, keep) {
+		if h.closeOpenVehicleEpisodes(ctx, entry, sources, stillConfigured) {
 			closed = true
 		}
 	}
@@ -984,19 +1015,23 @@ func (h *HistoryService) CloseOpenVehicleEpisodes(ctx context.Context, servers [
 }
 
 // closeOpenVehicleEpisodes closes entry's open episodes whose feed source is
-// not in keep, then drops the closed ones from memory. A nil keep closes every
-// open episode of the server, which is what a server that left the
-// configuration needs.
-func (h *HistoryService) closeOpenVehicleEpisodes(ctx context.Context, entry *serverVehicleEpisodes, keep map[string]struct{}) bool {
+// not in keep, then drops the closed ones from memory. stillConfigured is
+// false for a server that left the configuration: every one of its episodes
+// is then a departure, including those of legacy endpoints with no source.
+func (h *HistoryService) closeOpenVehicleEpisodes(ctx context.Context, entry *serverVehicleEpisodes, keep map[string]struct{}, stillConfigured bool) bool {
 	entry.mu.Lock()
-	departures := collectVehicleDepartures(entry.open, keep)
+	departures := collectVehicleDepartures(entry.open, keep, stillConfigured)
 	entry.mu.Unlock()
 	if len(departures) == 0 {
 		return false
 	}
 	if !h.closeDepartedVehicleEpisodes(ctx, entry.server, departures...) {
-		// The episodes stay in memory when the write fails, so the next
-		// configuration update retries them.
+		// The commit may have reached the database even though the client
+		// saw an error, so memory can no longer be trusted. Reload before the
+		// next close, as a failed normal write does in RecordVehiclePositions.
+		entry.mu.Lock()
+		entry.loaded = false
+		entry.mu.Unlock()
 		return false
 	}
 	entry.mu.Lock()
@@ -1012,11 +1047,17 @@ func (h *HistoryService) closeOpenVehicleEpisodes(ctx context.Context, entry *se
 }
 
 // collectVehicleDepartures gathers the open episodes whose source is not in
-// keep. A nil or empty keep means every open episode is a departure.
-func collectVehicleDepartures(open map[vehicleEpisodeKey]*openVehicleEpisode, keep map[string]struct{}) []vehicleDeparture {
+// keep, sorted for a deterministic write. A server that is no longer
+// configured departs whole, so every episode counts. On a configured server
+// an unknown source is kept: it belongs to a pre-upgrade endpoint whose query
+// string was never stored, and closing it would blame the wrong feed.
+func collectVehicleDepartures(open map[vehicleEpisodeKey]*openVehicleEpisode, keep map[string]struct{}, stillConfigured bool) []vehicleDeparture {
 	var departures []vehicleDeparture
 	for key, episode := range open {
-		if len(keep) > 0 {
+		if stillConfigured {
+			if !sourceIsKnown(key.source) {
+				continue
+			}
 			if _, ok := keep[key.source]; ok {
 				continue
 			}

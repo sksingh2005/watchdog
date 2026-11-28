@@ -39,7 +39,7 @@ func (q *Queries) GetVehiclePositionEndpoint(ctx context.Context, endpointID int
 }
 
 const listServerVehiclePositionEndpoints = `-- name: ListServerVehiclePositionEndpoints :many
-SELECT endpoint_id, server_id, normalized_vehicle_position_url, created_at
+SELECT endpoint_id, server_id, normalized_vehicle_position_url, feed_source_key, created_at
 FROM vehicle_position_endpoint
 WHERE server_id = $1
 ORDER BY endpoint_id
@@ -49,6 +49,7 @@ type ListServerVehiclePositionEndpointsRow struct {
 	EndpointID                   int64
 	ServerID                     int64
 	NormalizedVehiclePositionUrl string
+	FeedSourceKey                *string
 	CreatedAt                    time.Time
 }
 
@@ -67,6 +68,7 @@ func (q *Queries) ListServerVehiclePositionEndpoints(ctx context.Context, server
 			&i.EndpointID,
 			&i.ServerID,
 			&i.NormalizedVehiclePositionUrl,
+			&i.FeedSourceKey,
 			&i.CreatedAt,
 		); err != nil {
 			return nil, err

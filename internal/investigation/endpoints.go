@@ -74,13 +74,14 @@ func (s *InvestigationService) listServerVehiclePositionEndpoints(w http.Respons
 		if err != nil {
 			return err
 		}
-		configured := configuredVehiclePositionURLs(s.Servers(), server.NormalizedBaseUrl)
+		configured := configuredVehiclePositionSources(s.Servers(), server.NormalizedBaseUrl)
 		endpoints := make([]dbgen.VehiclePositionEndpoint, 0, len(rows))
 		for _, row := range rows {
 			endpoints = append(endpoints, dbgen.VehiclePositionEndpoint{
 				EndpointID:                   row.EndpointID,
 				ServerID:                     row.ServerID,
 				NormalizedVehiclePositionUrl: row.NormalizedVehiclePositionUrl,
+				FeedSourceKey:                row.FeedSourceKey,
 				CreatedAt:                    row.CreatedAt,
 			})
 		}
@@ -99,19 +100,35 @@ func (s *InvestigationService) listServerVehiclePositionEndpoints(w http.Respons
 	s.writeJSON(w, r, body, cacheShort())
 }
 
-// configuredVehiclePositionURLs returns the normalized vehicle-position URL
-// of every GTFS-RT feed configured for the server at baseURL (a normalized
-// base URL). An agency-mode server has one configuration entry per agency,
-// so the feeds of every entry for that server count.
-func configuredVehiclePositionURLs(servers []models.ObaServer, baseURL string) map[string]bool {
-	configured := map[string]bool{}
+// configuredEndpoints holds the two ways a feed can be recognized as still
+// configured. New endpoints carry the hash of the full configured URL; legacy
+// endpoints created before migration 00006 have a NULL key, so their
+// normalized URL is the only identity available for them.
+type configuredEndpoints struct {
+	sources map[string]bool
+	urls    map[string]bool
+}
+
+// configuredVehiclePositionSources returns the feed source keys and normalized
+// URLs configured for the server at baseURL (a normalized base URL). An
+// agency-mode server has one configuration entry per agency, so the feeds of
+// every entry for that server count.
+func configuredVehiclePositionSources(servers []models.ObaServer, baseURL string) configuredEndpoints {
+	configured := configuredEndpoints{
+		sources: map[string]bool{},
+		urls:    map[string]bool{},
+	}
 	for _, s := range servers {
 		if utils.SanitizeServerURL(s.ObaBaseURL) != baseURL {
 			continue
 		}
 		for _, feed := range s.GtfsRTFeeds {
+			if feed.VehiclePositionURL == "" {
+				continue
+			}
+			configured.sources[models.FeedSourceKey(feed.VehiclePositionURL)] = true
 			if u := utils.SanitizeServerURL(feed.VehiclePositionURL); u != "" {
-				configured[u] = true
+				configured.urls[u] = true
 			}
 		}
 	}
@@ -119,10 +136,10 @@ func configuredVehiclePositionURLs(servers []models.ObaServer, baseURL string) m
 }
 
 // endpointItems maps rows to their representations, and returns each item's
-// links for loadIncluded. configured holds the normalized vehicle-position
-// URLs the server's configuration fetches. The items are never nil, so an
-// empty list encodes as [] rather than null.
-func endpointItems(rows []dbgen.VehiclePositionEndpoint, configured map[string]bool) ([]vehiclePositionEndpoint, []itemLinks) {
+// links for loadIncluded. configured holds what the server's configuration
+// still fetches. The items are never nil, so an empty list encodes as [] rather
+// than null.
+func endpointItems(rows []dbgen.VehiclePositionEndpoint, configured configuredEndpoints) ([]vehiclePositionEndpoint, []itemLinks) {
 	items := make([]vehiclePositionEndpoint, 0, len(rows))
 	related := make([]itemLinks, 0, len(rows))
 	for _, row := range rows {
@@ -152,16 +169,25 @@ func endpointLinks(row dbgen.VehiclePositionEndpoint) itemLinks {
 
 // endpointRepresentation maps one row to the representation that E06 lists
 // and E07 returns.
-func endpointRepresentation(row dbgen.VehiclePositionEndpoint, l itemLinks, configured map[string]bool) vehiclePositionEndpoint {
+func endpointRepresentation(row dbgen.VehiclePositionEndpoint, l itemLinks, configured configuredEndpoints) vehiclePositionEndpoint {
 	out := l.links()
 	out["vehicle_anomaly_episodes"] = linkWithQuery("/v1/vehicle-anomaly-episodes",
 		url.Values{"endpoint_id": {strconv.FormatInt(row.EndpointID, 10)}})
+	isConfigured := false
+	if row.FeedSourceKey != nil {
+		// The full URL, including its query string, decides identity now:
+		// two feeds sharing a normalized URL are different sources.
+		isConfigured = configured.sources[*row.FeedSourceKey]
+	} else {
+		// A legacy row has no source key; its normalized URL is all we have.
+		isConfigured = configured.urls[row.NormalizedVehiclePositionUrl]
+	}
 	return vehiclePositionEndpoint{
 		EndpointID:                   row.EndpointID,
 		ServerID:                     row.ServerID,
 		NormalizedVehiclePositionURL: row.NormalizedVehiclePositionUrl,
 		CreatedAt:                    newAPITime(row.CreatedAt),
-		Configured:                   configured[row.NormalizedVehiclePositionUrl],
+		Configured:                   isConfigured,
 		Links:                        out,
 	}
 }
@@ -198,7 +224,7 @@ func (s *InvestigationService) getVehiclePositionEndpoint(w http.ResponseWriter,
 			return err
 		}
 		l := endpointLinks(row.VehiclePositionEndpoint)
-		configured := configuredVehiclePositionURLs(s.Servers(), row.NormalizedBaseUrl)
+		configured := configuredVehiclePositionSources(s.Servers(), row.NormalizedBaseUrl)
 		body.vehiclePositionEndpoint = endpointRepresentation(row.VehiclePositionEndpoint, l, configured)
 		body.Included, err = s.loadIncluded(ctx, q, []itemLinks{l}, inc)
 		return err
@@ -224,12 +250,12 @@ func loadVehiclePositionEndpoints(ctx context.Context, q *dbgen.Queries, ids []i
 	if err != nil {
 		return nil, err
 	}
-	configuredByServer := map[string]map[string]bool{}
+	configuredByServer := map[string]configuredEndpoints{}
 	out := make(map[int64]any, len(rows))
 	for _, row := range rows {
 		configured, ok := configuredByServer[row.NormalizedBaseUrl]
 		if !ok {
-			configured = configuredVehiclePositionURLs(servers, row.NormalizedBaseUrl)
+			configured = configuredVehiclePositionSources(servers, row.NormalizedBaseUrl)
 			configuredByServer[row.NormalizedBaseUrl] = configured
 		}
 		endpoint := row.VehiclePositionEndpoint

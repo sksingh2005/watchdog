@@ -33,6 +33,7 @@ RETURNING rule_version_id;
 SELECT
     e.vehicle_anomaly_episode_id,
     t.anomaly_code,
+    ep.endpoint_id,
     ep.normalized_vehicle_position_url,
     ep.feed_source_key,
     v.external_vehicle_id,
@@ -57,6 +58,19 @@ LEFT JOIN LATERAL (
 ) latest ON TRUE
 WHERE srv.normalized_base_url = @normalized_base_url
   AND e.closing_response_id IS NULL;
+
+-- name: ListServerBaseURLsWithOpenVehicleAnomalies :many
+-- Every server base URL that still has an open vehicle-anomaly episode,
+-- including servers no longer in the configuration. Startup and config
+-- refreshes use this to close episodes of servers Watchdog no longer has an
+-- in-memory entry for.
+SELECT DISTINCT srv.normalized_base_url
+FROM vehicle_anomaly_episode e
+JOIN vehicle_entity v ON v.vehicle_entity_id = e.vehicle_entity_id
+JOIN vehicle_position_endpoint ep ON ep.endpoint_id = v.endpoint_id
+JOIN onebusaway_server srv ON srv.server_id = ep.server_id
+WHERE e.closing_response_id IS NULL
+ORDER BY srv.normalized_base_url;
 
 -- name: InsertVehiclePositionResponse :one
 INSERT INTO vehicle_position_response (

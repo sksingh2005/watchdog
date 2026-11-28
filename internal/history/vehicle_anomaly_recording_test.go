@@ -611,3 +611,29 @@ func TestRecordVehiclePositions_PrunesOldSightings(t *testing.T) {
 		t.Fatal("dropped a current sighting")
 	}
 }
+
+// collectVehicleDepartures keeps episodes whose feed source cannot be
+// identified (a legacy endpoint) on a configured server: the query string
+// was never stored, so a still-configured feed must not be blamed. When the
+// whole server leaves the configuration, every episode is a departure,
+// including the legacy ones.
+func TestCollectVehicleDepartures_LegacySources(t *testing.T) {
+	known := models.FeedSourceKey(vehicleFeedURL)
+	other := models.FeedSourceKey(vehicleFeedURL + "?agency=other")
+	legacy := legacySource(42)
+	open := map[vehicleEpisodeKey]*openVehicleEpisode{
+		{source: known, vehicleID: "kept", anomaly: anomalyInvalidCoordinate}:    {episodeID: 1},
+		{source: other, vehicleID: "removed", anomaly: anomalyInvalidCoordinate}: {episodeID: 2},
+		{source: legacy, vehicleID: "legacy", anomaly: anomalyInvalidCoordinate}: {episodeID: 3},
+		{source: "", vehicleID: "unknown", anomaly: anomalyInvalidCoordinate}:    {episodeID: 4},
+	}
+
+	kept := collectVehicleDepartures(open, map[string]struct{}{known: {}}, true)
+	if len(kept) != 1 || kept[0].episodeID != 2 {
+		t.Fatalf("configured server departures = %+v, want only the removed feed", kept)
+	}
+	all := collectVehicleDepartures(open, map[string]struct{}{known: {}}, false)
+	if len(all) != len(open) {
+		t.Fatalf("removed server departures = %+v, want all %d episodes", all, len(open))
+	}
+}
