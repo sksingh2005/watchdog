@@ -663,10 +663,14 @@
           },
           {
             "matcher": {
-              "id": "byRegexp",
-              "options": ".*records_count.*"
+              "id": "byFrameRefID",
+              "options": "D"
             },
             "properties": [
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
               {
                 "id": "custom.fillOpacity",
                 "value": 0
@@ -674,6 +678,10 @@
               {
                 "id": "custom.lineWidth",
                 "value": 2
+              },
+              {
+                "id": "unit",
+                "value": "percentunit"
               }
             ]
           }
