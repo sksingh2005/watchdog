@@ -75,7 +75,16 @@ func (s *InvestigationService) listServerVehiclePositionEndpoints(w http.Respons
 			return err
 		}
 		configured := configuredVehiclePositionURLs(s.Servers(), server.NormalizedBaseUrl)
-		items, related := endpointItems(rows, configured)
+		endpoints := make([]dbgen.VehiclePositionEndpoint, 0, len(rows))
+		for _, row := range rows {
+			endpoints = append(endpoints, dbgen.VehiclePositionEndpoint{
+				EndpointID:                   row.EndpointID,
+				ServerID:                     row.ServerID,
+				NormalizedVehiclePositionUrl: row.NormalizedVehiclePositionUrl,
+				CreatedAt:                    row.CreatedAt,
+			})
+		}
+		items, related := endpointItems(endpoints, configured)
 		body = vehiclePositionEndpointList{
 			Items: items,
 			Links: links{"self": linkWithQuery(r.URL.Path, r.URL.Query())},

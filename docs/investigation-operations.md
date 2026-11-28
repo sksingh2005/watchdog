@@ -44,7 +44,7 @@ Check the database status and the `DATABASE_URL` setting. Once PostgreSQL is rea
 
 ## History retention
 
-The investigation history policy keeps closed episodes and their evidence for 90 days after closure. Open episodes for configured servers are kept until they close. Open episodes for removed servers expire 90 days after their last observation. Automatic cleanup is tracked in [#203](https://github.com/OneBusAway/watchdog/issues/203).
+The investigation history policy keeps closed episodes and their evidence for 90 days after closure. Open episodes for configured servers are kept until they close. When a server or a vehicle-position feed leaves the configuration, Watchdog closes the open vehicle-anomaly episodes with the `feed_removed` close reason, against a response recorded for the removal, so no open episode outlives the feed that produced it; retention then deletes closed episodes 90 days after closure. Automatic cleanup is tracked in [#203](https://github.com/OneBusAway/watchdog/issues/203).
 
 ## Verify a deploy
 

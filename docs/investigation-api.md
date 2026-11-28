@@ -213,7 +213,7 @@ This section defines the use cases the API must support. Each use case states wh
   1. `GET /v1/vehicles?server_id=&vehicle_id=` to resolve the vehicle.
   2. Follow `links` to its anomaly episodes, filtered by `anomaly_type=stale_source_timestamp` and a window around the reported time.
   3. Follow `links.evidence` to read the source timestamp the feed carried, Watchdog's observation time, the trip descriptor, and `expected_schedule_state` with its scheduled window.
-  4. Read `close_reason` to see whether the episode ended with fresh data or because the vehicle left a complete feed.
+  4. Read `close_reason` to see whether the episode ended with fresh data, because the vehicle left a complete feed, or because the server or feed was removed from the configuration.
 - **Value to the observer:** Distinguishes three cases:
   - the feed carried outdated positions during scheduled service (a feed or device problem);
   - the vehicle's trip had already ended and the feed kept a residual entry (expected behaviour);
@@ -286,7 +286,7 @@ This section defines the use cases the API must support. Each use case states wh
 - **Procedure:**
   1. `GET /v1/vehicle-anomaly-episodes/{id}` and read `close_reason`.
   2. Follow `links.evidence` for the `resolution` evidence.
-- **Value to the observer:** Distinguishes recovery (`fresh_source_timestamp`, `coordinates_valid_again`, `inside_bounding_box`) from removal (`not_present_in_full_dataset`), which may simply mean the vehicle's trip ended.
+- **Value to the observer:** Distinguishes recovery (`fresh_source_timestamp`, `coordinates_valid_again`, `inside_bounding_box`) from removal (`not_present_in_full_dataset`, which may simply mean the vehicle's trip ended) or removal by configuration (`feed_removed`, which means Watchdog closed the episode because the server or feed was removed from the configuration).
 - **Limitations:** Close reasons describe the observed condition, not a physical cause.
 
 #### UC-13: Verify the effect of a corrective action
@@ -471,7 +471,7 @@ The following cannot be established from the stored data. The API must not prese
 | What happened between observations | Episode boundaries are observation times. |
 | The physical cause of a vehicle anomaly | Evidence records feed values, not vehicle or equipment state. |
 | A vehicle's complete path or position history | Only anomaly evidence is stored, not every position. |
-| When vehicles left the feed, or when PostgreSQL was unavailable | Both are deferred in ADR 0001. |
+| When a vehicle left a feed Watchdog still fetched, or when PostgreSQL was unavailable | A vehicle absent from a full response is now established as an episode close (`not_present_in_full_dataset`); when the server or feed itself left the configuration the episode closes as `feed_removed`. PostgreSQL availability recording remains deferred in ADR 0001. |
 | Anything before the investigation store was deployed | Earlier Prometheus history is not imported. |
 | How many vehicles a feed carried | Only anomaly evidence is stored. Fleet size is in Prometheus. |
 | OBA's counts between stored polls | A metrics response is stored only when it opens or closes an episode. |
@@ -654,7 +654,7 @@ These carry over from the ADR and the schema document:
 - Unmatched episodes expose `close_reason`: `"not_reported"` when a complete response stopped listing the ID, `"agency_unlisted"` or `"agency_removed"` (stop episodes only) when the agency disappeared. No representation has `resolved`, `fixed`, or `matched` fields.
 - Static context is labelled `"source": "watchdog_static_gtfs"`. It is what Watchdog's static GTFS said, not proof of what OBA used.
 - `opened_at` and `closed_at` are Watchdog observation times, not the moment a condition actually began or ended.
-- Vehicle close reasons describe the observed closing condition, such as `not_present_in_full_dataset`, never a cause.
+- Vehicle close reasons describe the observed closing condition, such as `not_present_in_full_dataset`, `feed_removed`, or a recovery value, never a cause.
 - Recurrence values are `has_previous_episode` and `no_previous_episode`. They describe retained history only, so no representation uses words such as `new` or `first_time`.
 
 ---
@@ -677,8 +677,8 @@ This section describes every endpoint listed in [Section 1](#1-supported-endpoin
 | E03 | `/v1/servers/{server_id}` | One server: `normalized_base_url`, `display_name`, `created_at`, `configured` (D12). | `onebusaway_server` |
 | E04 | `/v1/servers/{server_id}/agencies` | Agencies seen on the server. Optional filter `external_agency_id`: returns the matching agency or an empty list (D10). | `agency` |
 | E05 | `/v1/agencies/{agency_id}` | One agency: `external_agency_id`, `current_name`. | `agency` |
-| E06 | `/v1/servers/{server_id}/vehicle-position-endpoints` | Feed URLs used by the server, including ones no longer configured, each with `configured` (D12). | `vehicle_position_endpoint` |
-| E07 | `/v1/vehicle-position-endpoints/{endpoint_id}` | One feed URL, with credentials already removed, and `configured` (D12). | `vehicle_position_endpoint` |
+| E06 | `/v1/servers/{server_id}/vehicle-position-endpoints` | Feed sources used by the server, including ones no longer configured, each with `configured` (D12). | `vehicle_position_endpoint` |
+| E07 | `/v1/vehicle-position-endpoints/{endpoint_id}` | One feed source, with credentials already removed, and `configured` (D12). | `vehicle_position_endpoint` |
 
 ### 4.3 Unmatched stops and trips
 
@@ -1076,8 +1076,8 @@ These decisions are final. Implementation issues quote them by identifier, and c
 | D8 | **Authentication.** Clients send `Authorization: Bearer <token>`. Watchdog accepts the value of `INVESTIGATION_API_TOKEN` and, when set, `INVESTIGATION_API_TOKEN_NEXT`, so a token can be rotated without downtime. Tokens are compared with `crypto/subtle.ConstantTimeCompare`. A missing or wrong token returns `401` with `WWW-Authenticate: Bearer realm="watchdog-investigation"`. When `INVESTIGATION_API_TOKEN` is unset, the routes are not registered. Tokens are never logged. The API has no CORS headers and no rate limiting. |
 | D9 | **API metrics.** Watchdog exports `watchdog_investigation_api_requests_total` (counter; labels `route`, `status`) and `watchdog_investigation_api_request_duration_seconds` (histogram, default buckets; label `route`). `route` is the route template, for example `/v1/unmatched-stop-episodes/:episode_id`, never the request path. Both vectors are wrapped in `tracked(...)` as `CLAUDE.md` requires. |
 | D10 | **Resolving names to IDs is the client's job.** A client that knows a server by its base URL and an agency by its OBA agency ID resolves them once with `GET /v1/servers?base_url=` (E02) and `GET /v1/servers/{server_id}/agencies?external_agency_id=` (E04), caches the returned IDs, and uses them afterwards. Other endpoints accept internal IDs only. E02 normalizes `base_url` with the same function Watchdog uses to fill `normalized_base_url`. |
-| D11 | **A changed URL is a new identity.** A changed server base URL, vehicle-position URL or static source URL creates a new identity row with a new ID. History recorded under the old URL stays under the old ID. Identities are never merged. |
-| D12 | **`configured` flag.** Servers (E02, E03) and vehicle-position endpoints (E06, E07) include a derived boolean `configured`: whether Watchdog's current configuration contains that server or URL. |
+| D11 | **A changed URL is a new identity.** A changed server base URL, vehicle-position source or static source URL creates a new identity row with a new ID. The vehicle-position identity is the server plus its feed source: the SHA-256 hash of the full configured vehicle-position URL, query string included, so feeds that differ only by query string are different sources and therefore different endpoints. History recorded under the old source stays under the old ID. Identities are never merged. |
+| D12 | **`configured` flag.** Servers (E02, E03) and vehicle-position endpoints (E06, E07) include a derived boolean `configured`: whether Watchdog's current configuration contains that server or fetches that vehicle-position source. A source whose URL changed, or that a removed feed left, is not configured. |
 | D26 | **Grouped counts.** E41 accepts `episode_type` and one `group_by` dimension from the table in Section 4.6. Each group has the ungrouped counts, a `value`, and `links`. At most 200 groups are returned (D22), with `groups_truncated: true` when more exist. `opened_hour` allows a window of at most 7 days. Several dimensions per request are out of scope. |
 | D27 | **Every dimension is also a filter.** Each `group_by` dimension has a matching filter on E14, E17 or E24, and each group's `links.episodes` uses it together with `opened_from`/`opened_to`, so a group's `opened` count and its episode list describe the same episodes. |
 | D28 | **Recurrence fields.** Every episode has `previous_episode_count`, the number of retained episodes of the same identity that opened before it (for vehicles, the same vehicle and anomaly type), and `previous_closed_at`, when the most recent of those closed, or null. The `recurrence` filter and dimension use `has_previous_episode` when the count is above zero and `no_previous_episode` otherwise. Retention can lower the count on an existing episode. |
@@ -1090,7 +1090,7 @@ These decisions are final. Implementation issues quote them by identifier, and c
 | D13 | **No backend type.** Java OBA and Maglev are treated as one system. Watchdog does not store or expose which implementation produced a response. |
 | D14 | **Mid-episode evidence.** While a vehicle anomaly episode is open, Watchdog saves a `meaningful_change` evidence row only when the vehicle's `trip_id` or `trip_start_date` differs from the most recently saved evidence row for that episode. Nothing else creates one. |
 | D15 | **Reason codes** are fixed and enforced by `CHECK` constraints. `position_validation_reason` (null exactly when `position_valid`): `missing_position`, `non_finite_coordinate`, `placeholder_zero_coordinate`, `latitude_out_of_range`, `longitude_out_of_range`. `attribution_reason`: the `gtfs.AttributionFailureReason` values `missing_vehicle_id`, `missing_route_id`, `unknown_route_id`, `agency_not_reported_by_oba`, `ambiguous_identifier`, `route_trip_conflict`. `expected_schedule_reason`: with state `unknown`, one of `no_trip_descriptor`, `trip_not_in_static_gtfs`, `trip_instance_ambiguous`; with `expected_inactive`, one of `service_not_active_on_date`, `before_scheduled_window`, `after_scheduled_window`; with `expected_active`, `within_scheduled_window`. |
-| D16 | **Server removal and retention.** A server removed from the configuration keeps its history, which stays queryable. Its open episodes stay open. A retention job runs every 24 hours. It deletes closed episodes 90 days after `closed_at`, and open episodes of servers that are no longer configured 90 days after their last observation (`last_reported_at` for unmatched episodes; the newest evidence's response `observed_at` for vehicle episodes). It then deletes static context, responses and identities that nothing references. |
+| D16 | **Server removal and retention.** A server removed from the configuration keeps its history, which stays queryable. When the server or one of its vehicle-position feeds leaves the configuration, Watchdog closes that feed's open vehicle-anomaly episodes with `close_reason: feed_removed` (and the affected agency episodes with their removal reasons), so no open episode outlives the feed that produced it; retention then deletes closed episodes 90 days after `closed_at`, and open episodes of servers that are still configured 90 days after their last observation (`last_reported_at` for unmatched episodes; the newest evidence's response `observed_at` for vehicle episodes). It then deletes static context, responses and identities that nothing references. A retention job runs every 24 hours. |
 | D17 | **Speed anomalies** (`reported_speed_plausibility`) are out of scope until a plausibility threshold is approved. |
 | D18 | **Recording runs synchronously and never blocks collection.** Recording code lives in a new package `internal/history`, in a `HistoryService` that follows the Service pattern in `CLAUDE.md` and is wired through `app.New`. Each collection step records its history right after it runs, under a 5-second context timeout and following D31 (which decides when a step actually writes), only when `Application.InvestigationDB` is not nil. A failed write is logged and reported to Sentry with the step's `server_name` (and `agency_id`/`agency_name` when agency-scoped) tags, following `CLAUDE.md`; collection then continues. Nothing is buffered or retried, so an observation that fails to write is lost. A later change may move writes to a queue for reliability; that is out of scope for the initial implementation. |
 | D19 | **Collections scoped to one identity have no default window.** E10, E13 and E23 return every retained episode of one stop, trip or vehicle, newest first, bounded by retention and pagination. E34 returns every retained static version. On these endpoints `active_from`/`active_to` (or `published_from`/`published_to` on E34) are optional and have no 31-day maximum. |

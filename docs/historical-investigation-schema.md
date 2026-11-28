@@ -304,9 +304,10 @@ erDiagram
 | `server_id` | `BIGINT NOT NULL` | Foreign key to `onebusaway_server`. |
 | `normalized_vehicle_position_url` | `TEXT NOT NULL` | Vehicle-position URL with credentials and secret query values removed. |
 | `created_at` | `TIMESTAMPTZ NOT NULL DEFAULT now()` | First time this endpoint is recorded. |
-| `UNIQUE` |  | `(server_id, normalized_vehicle_position_url)`. |
+| `feed_source_key` | `TEXT` | SHA-256 hash of the full configured vehicle-position URL, query string included; the endpoint's identity within its server (migration `00006`). |
+| `UNIQUE` |  | `(server_id, feed_source_key)`. |
 
-Do not use the zero-based configuration index as an identity. The same URL on one server maps to the same endpoint row; a changed URL creates a different row. The same rule applies to server base URLs and static source URLs: a changed URL is a new identity with a new ID, and identities are never merged (D11 in [investigation-api.md](investigation-api.md#6-implementation-decisions)). Incidents retain the endpoint row they used. `trip_update_url` is not part of this table because Watchdog currently does not fetch it for vehicle investigation.
+Do not use the zero-based configuration index as an identity. The same source on one server maps to the same endpoint row; a changed source, including one that differs only by query string, creates a different row. The same rule applies to server base URLs and static source URLs: a changed URL is a new identity with a new ID, and identities are never merged (D11 in [investigation-api.md](investigation-api.md#6-implementation-decisions)). Incidents retain the endpoint row they used. `trip_update_url` is not part of this table because Watchdog currently does not fetch it for vehicle investigation.
 
 **`vehicle_entity`**
 
@@ -575,11 +576,11 @@ The opening time is the opening response's `observed_at`, and the closing time i
 
 The opening and closing responses must belong to the vehicle's endpoint, and the closing response must not be observed before the opening one. A trigger enforces both, since plain foreign keys cannot compare rows. The episode's `opening` evidence link must point to evidence from the same `opening_response_id`; write the episode, its opening evidence, and the link in one transaction.
 
-Close reasons are type-specific values such as `fresh_source_timestamp`, `not_present_in_full_dataset`, `coordinates_valid_again`, `inside_bounding_box`, or `no_longer_stopped_at_stop`. They describe the observed closing condition, not a physical root cause.
+Close reasons are type-specific values such as `fresh_source_timestamp`, `not_present_in_full_dataset`, `feed_removed`, `coordinates_valid_again`, `inside_bounding_box`, or `no_longer_stopped_at_stop`. They describe the observed closing condition, not a physical root cause. `feed_removed` closes an episode whose server or feed left the configuration; Watchdog records a response for the removal and closes against it. `not_present_in_full_dataset` closes an episode because a complete response lacked the vehicle, which may mean the vehicle's trip ended.
 
 **`vehicle_anomaly_episode_evidence`** has `vehicle_anomaly_episode_id BIGINT NOT NULL`, `vehicle_position_evidence_id BIGINT NOT NULL`, and `evidence_role TEXT NOT NULL`, checked to `opening`, `meaningful_change`, or `resolution`. The primary key is `(vehicle_anomaly_episode_id, vehicle_position_evidence_id, evidence_role)`. Its ID columns are foreign keys. Add a partial unique index permitting one `opening` link and one `resolution` link per episode; any number of `meaningful_change` links are allowed. Do not duplicate `evidence_role` on the vehicle evidence row.
 
-A partial unique index permits one open episode per `(vehicle_entity_id, anomaly_type_id)`. A vehicle-position response can close an episode because the vehicle became fresh or because it was absent from a complete response. The close reason distinguishes these cases.
+A partial unique index permits one open episode per `(vehicle_entity_id, anomaly_type_id)`. A vehicle-position response can close an episode because the vehicle became fresh or because it was absent from a complete response. The close reason distinguishes these cases; `feed_removed` closes an episode whose server or feed left the configuration, against a response Watchdog recorded for the removal.
 
 ### Indexes, retention, and exclusions
 
@@ -650,7 +651,7 @@ CREATE INDEX vehicle_position_evidence_agency_response
     ON vehicle_position_evidence (agency_id, vehicle_position_response_id);
 ```
 
-A retention job runs every 24 hours (D16). It deletes closed episodes and their evidence 90 days after `closed_at`. Open episodes are kept until they close, except for servers no longer in the configuration: their open episodes are deleted 90 days after their last observation (`last_reported_at` for unmatched episodes, which is saved when the server is removed; the newest evidence's response `observed_at` for vehicle episodes). A removed server's history otherwise stays queryable. Static context, responses and identities are deleted once nothing references them. Do not store raw full-feed payloads or normal per-vehicle samples.
+A retention job runs every 24 hours (D16). It deletes closed episodes and their evidence 90 days after `closed_at`. Open episodes are kept until they close, except that Watchdog closes the open episodes of a server or feed that left the configuration with the `feed_removed` close reason, so retention deletes them 90 days after that closure; for a server or feed that is still configured an open episode is kept until it closes, deleted 90 days after its last observation (`last_reported_at` for unmatched episodes, which is saved when the server is removed; the newest evidence's response `observed_at` for vehicle episodes). A removed server's history otherwise stays queryable. Static context, responses and identities are deleted once nothing references them. Do not store raw full-feed payloads or normal per-vehicle samples.
 
 The initial schema does not include separate vehicle-feed-absence records or PostgreSQL-outage records. Vehicle absence is informational and does not prove a vehicle problem; PostgreSQL availability recording and alerting remain deferred.
 

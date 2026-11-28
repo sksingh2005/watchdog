@@ -278,6 +278,7 @@ SELECT
     e.vehicle_anomaly_episode_id,
     t.anomaly_code,
     ep.normalized_vehicle_position_url,
+    ep.feed_source_key,
     v.external_vehicle_id,
     latest.trip_id,
     latest.trip_start_date,
@@ -306,6 +307,7 @@ type ListOpenVehicleAnomalyEpisodesForServerRow struct {
 	VehicleAnomalyEpisodeID      int64
 	AnomalyCode                  string
 	NormalizedVehiclePositionUrl string
+	FeedSourceKey                *string
 	ExternalVehicleID            string
 	TripID                       *string
 	TripStartDate                pgtype.Date
@@ -330,6 +332,7 @@ func (q *Queries) ListOpenVehicleAnomalyEpisodesForServer(ctx context.Context, n
 			&i.VehicleAnomalyEpisodeID,
 			&i.AnomalyCode,
 			&i.NormalizedVehiclePositionUrl,
+			&i.FeedSourceKey,
 			&i.ExternalVehicleID,
 			&i.TripID,
 			&i.TripStartDate,

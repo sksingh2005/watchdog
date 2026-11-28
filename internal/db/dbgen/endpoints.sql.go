@@ -7,10 +7,11 @@ package dbgen
 
 import (
 	"context"
+	"time"
 )
 
 const getVehiclePositionEndpoint = `-- name: GetVehiclePositionEndpoint :one
-SELECT e.endpoint_id, e.server_id, e.normalized_vehicle_position_url, e.created_at, s.normalized_base_url
+SELECT e.endpoint_id, e.server_id, e.normalized_vehicle_position_url, e.created_at, e.feed_source_key, s.normalized_base_url
 FROM vehicle_position_endpoint e
 JOIN onebusaway_server s ON s.server_id = e.server_id
 WHERE e.endpoint_id = $1
@@ -31,6 +32,7 @@ func (q *Queries) GetVehiclePositionEndpoint(ctx context.Context, endpointID int
 		&i.VehiclePositionEndpoint.ServerID,
 		&i.VehiclePositionEndpoint.NormalizedVehiclePositionUrl,
 		&i.VehiclePositionEndpoint.CreatedAt,
+		&i.VehiclePositionEndpoint.FeedSourceKey,
 		&i.NormalizedBaseUrl,
 	)
 	return i, err
@@ -43,17 +45,24 @@ WHERE server_id = $1
 ORDER BY endpoint_id
 `
 
+type ListServerVehiclePositionEndpointsRow struct {
+	EndpointID                   int64
+	ServerID                     int64
+	NormalizedVehiclePositionUrl string
+	CreatedAt                    time.Time
+}
+
 // Every vehicle-position feed URL recorded for one OBA server, oldest ID
 // first, including URLs no longer in the configuration.
-func (q *Queries) ListServerVehiclePositionEndpoints(ctx context.Context, serverID int64) ([]VehiclePositionEndpoint, error) {
+func (q *Queries) ListServerVehiclePositionEndpoints(ctx context.Context, serverID int64) ([]ListServerVehiclePositionEndpointsRow, error) {
 	rows, err := q.db.Query(ctx, listServerVehiclePositionEndpoints, serverID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []VehiclePositionEndpoint
+	var items []ListServerVehiclePositionEndpointsRow
 	for rows.Next() {
-		var i VehiclePositionEndpoint
+		var i ListServerVehiclePositionEndpointsRow
 		if err := rows.Scan(
 			&i.EndpointID,
 			&i.ServerID,
@@ -71,7 +80,7 @@ func (q *Queries) ListServerVehiclePositionEndpoints(ctx context.Context, server
 }
 
 const listVehiclePositionEndpointsByIDs = `-- name: ListVehiclePositionEndpointsByIDs :many
-SELECT e.endpoint_id, e.server_id, e.normalized_vehicle_position_url, e.created_at, s.normalized_base_url
+SELECT e.endpoint_id, e.server_id, e.normalized_vehicle_position_url, e.created_at, e.feed_source_key, s.normalized_base_url
 FROM vehicle_position_endpoint e
 JOIN onebusaway_server s ON s.server_id = e.server_id
 WHERE e.endpoint_id = ANY($1::bigint[])
@@ -99,6 +108,7 @@ func (q *Queries) ListVehiclePositionEndpointsByIDs(ctx context.Context, endpoin
 			&i.VehiclePositionEndpoint.ServerID,
 			&i.VehiclePositionEndpoint.NormalizedVehiclePositionUrl,
 			&i.VehiclePositionEndpoint.CreatedAt,
+			&i.VehiclePositionEndpoint.FeedSourceKey,
 			&i.NormalizedBaseUrl,
 		); err != nil {
 			return nil, err

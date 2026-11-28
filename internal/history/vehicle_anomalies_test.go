@@ -12,8 +12,7 @@ var planObservedAt = time.Date(2026, 11, 27, 12, 0, 0, 0, time.UTC)
 
 const (
 	planThreshold = 2 * time.Minute
-	planFeedURL   = "https://feed.example/vehicle-positions"
-	planSourceKey = "source-a"
+	planSource    = "source-a"
 )
 
 func boolPtr(b bool) *bool { return &b }
@@ -24,7 +23,7 @@ func timePtr(t time.Time) *time.Time { return &t }
 // rule finds an anomaly.
 func healthyVehicle(id string) vehicleObservation {
 	return vehicleObservation{
-		feedURL:       planFeedURL,
+		source:        planSource,
 		vehicleID:     id,
 		sourceTime:    timePtr(planObservedAt.Add(-10 * time.Second)),
 		stoppedAtStop: true,
@@ -35,15 +34,15 @@ func healthyVehicle(id string) vehicleObservation {
 }
 
 func fullFeed() []vehicleFeed {
-	return []vehicleFeed{{feedURL: planFeedURL, sourceKey: planSourceKey, observedAt: planObservedAt, fullDataset: true}}
+	return []vehicleFeed{{source: planSource, observedAt: planObservedAt, fullDataset: true}}
 }
 
 func differentialFeed() []vehicleFeed {
-	return []vehicleFeed{{feedURL: planFeedURL, sourceKey: planSourceKey, observedAt: planObservedAt, fullDataset: false}}
+	return []vehicleFeed{{source: planSource, observedAt: planObservedAt, fullDataset: false}}
 }
 
 func keyFor(id string, anomaly vehicleAnomalyType) vehicleEpisodeKey {
-	return vehicleEpisodeKey{feedURL: planFeedURL, vehicleID: id, anomaly: anomaly}
+	return vehicleEpisodeKey{source: planSource, vehicleID: id, anomaly: anomaly}
 }
 
 func openFor(keys ...vehicleEpisodeKey) map[vehicleEpisodeKey]*openVehicleEpisode {
@@ -59,7 +58,7 @@ func openFor(keys ...vehicleEpisodeKey) map[vehicleEpisodeKey]*openVehicleEpisod
 func sightingsFor(open map[vehicleEpisodeKey]*openVehicleEpisode) map[vehicleSightingKey]vehicleSighting {
 	sightings := make(map[vehicleSightingKey]vehicleSighting, len(open))
 	for key := range open {
-		sightings[vehicleSightingKey{feedURL: key.feedURL, vehicleID: key.vehicleID}] = vehicleSighting{sourceKey: planSourceKey, observedAt: planObservedAt.Add(-time.Minute)}
+		sightings[vehicleSightingKey{source: key.source, vehicleID: key.vehicleID}] = vehicleSighting{source: planSource, observedAt: planObservedAt.Add(-time.Minute)}
 	}
 	return sightings
 }
@@ -281,12 +280,12 @@ func TestVehicle_PlanIsSorted(t *testing.T) {
 	}
 }
 
-// Feeds that differ only by query string share a feed URL. A full dataset
+// Feeds that differ only by query string share a feed source. A full dataset
 // from one of them says nothing about the other's vehicles.
 func TestVehicle_AbsenceFromAnotherSourceIgnored(t *testing.T) {
 	open := openFor(keyFor("other-agency-bus", anomalyInvalidCoordinate))
 	feeds := fullFeed()
-	feeds[0].sourceKey = "source-b"
+	feeds[0].source = "source-b"
 	if plan := planVehicleAnomalies(open, sightingsFor(open), feeds, nil, planThreshold); !plan.empty() {
 		t.Fatalf("another source's full dataset changed %+v", plan)
 	}
@@ -298,7 +297,7 @@ func TestVehicle_AbsenceWithUnknownSourceIgnored(t *testing.T) {
 	open := openFor(keyFor("bus-1", anomalyInvalidCoordinate))
 	sightings := sightingsFor(open)
 	for key, sighting := range sightings {
-		sighting.sourceKey = ""
+		sighting.source = ""
 		sightings[key] = sighting
 	}
 	if plan := planVehicleAnomalies(open, sightings, fullFeed(), nil, planThreshold); !plan.empty() {
@@ -314,7 +313,7 @@ func TestVehicle_StaleResponseIgnored(t *testing.T) {
 	key := keyFor("bus-1", anomalyInvalidCoordinate)
 	open := openFor(key)
 	newer := map[vehicleSightingKey]vehicleSighting{
-		{feedURL: planFeedURL, vehicleID: "bus-1"}: {sourceKey: planSourceKey, observedAt: planObservedAt.Add(time.Minute)},
+		{source: planSource, vehicleID: "bus-1"}: {source: planSource, observedAt: planObservedAt.Add(time.Minute)},
 	}
 
 	if plan := planVehicleAnomalies(open, newer, fullFeed(), []vehicleObservation{healthyVehicle("bus-1")}, planThreshold); !plan.empty() {

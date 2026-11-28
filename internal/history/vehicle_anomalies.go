@@ -33,6 +33,9 @@ const (
 	closeCoordinatesValidAgain vehicleCloseReason = "coordinates_valid_again"
 	closeInsideBoundingBox     vehicleCloseReason = "inside_bounding_box"
 	closeNoLongerStoppedAtStop vehicleCloseReason = "no_longer_stopped_at_stop"
+	// closeFeedRemoved closes an episode whose server or feed left the
+	// configuration, so no later response can close it by absence.
+	closeFeedRemoved vehicleCloseReason = "feed_removed"
 )
 
 // The stale threshold is clamp(5 × fetch interval, 60 s, 300 s).
@@ -47,17 +50,20 @@ func staleThreshold(fetchInterval time.Duration) time.Duration {
 	return min(max(staleThresholdFetchMultiple*fetchInterval, minStaleThreshold), maxStaleThreshold)
 }
 
-// vehicleFeed is one feed of a realtime snapshot. feedURL is the sanitized
-// vehicle-position URL, the feed's identity in the database.
+// vehicleFeed is one feed of a realtime snapshot. source is the feed's
+// identity, models.FeedSourceKey of the configured feed URL, query string
+// included, so feeds that differ only by query string are different feeds.
+// feedURL is the sanitized form of that URL, kept for display and for the
+// vehicle-position endpoint row. observedAt is the snapshot's observation
+// time, fullDataset says whether the response was a full dataset, sourceTimestamp
+// the FeedHeader timestamp, and payloadHash the canonical entity hash.
 type vehicleFeed struct {
 	feedURL         string
+	source          string
 	observedAt      time.Time
 	fullDataset     bool
 	sourceTimestamp *time.Time
 	payloadHash     string
-	// sourceKey is models.FeedSourceKey of the configured feed URL. Feeds
-	// that differ only by query string share feedURL but not sourceKey.
-	sourceKey string
 	// reportedVehicleIDs holds every vehicle ID in the response, including
 	// vehicles that agency-mode filtering left out of this entry's
 	// observations. Nil means the observations are the whole response.
@@ -77,7 +83,7 @@ func (f vehicleFeed) reported(vehicleID string, observed bool) bool {
 // response. Resolving attribution and the bounding box happens before
 // planning, so the rules stay pure.
 type vehicleObservation struct {
-	feedURL   string
+	source    string
 	vehicleID string
 	// sourceTime is the vehicle's GTFS-Realtime timestamp, nil when absent.
 	sourceTime     *time.Time
@@ -93,9 +99,9 @@ type vehicleObservation struct {
 }
 
 // vehicleEpisodeKey identifies an episode: one anomaly type for one vehicle
-// of one feed.
+// of one feed source.
 type vehicleEpisodeKey struct {
-	feedURL   string
+	source    string
 	vehicleID string
 	anomaly   vehicleAnomalyType
 }
@@ -108,20 +114,20 @@ type openVehicleEpisode struct {
 	tripStartDate string
 }
 
-// vehicleSightingKey identifies a vehicle on a feed URL.
+// vehicleSightingKey identifies a vehicle on a feed source.
 type vehicleSightingKey struct {
-	feedURL   string
+	source    string
 	vehicleID string
 }
 
 // vehicleSighting is the newest response that reported a vehicle, kept in
 // memory only and whether or not the vehicle has an open episode.
 type vehicleSighting struct {
-	// sourceKey is the feed source of that response, empty while unknown
-	// after a restart. Feeds that differ only by query string share feedURL
-	// but each reports only its own vehicles, so only a response from this
-	// source can close the vehicle's episodes on absence.
-	sourceKey string
+	// source is the feed source of that response, empty while unknown after a
+	// restart. Feeds that differ only by query string are different sources, so
+	// only a response from this source can close the vehicle's episodes on
+	// absence.
+	source string
 	// observedAt is that response's observation time. Entries fetch
 	// concurrently, so an older response can be recorded after a newer one;
 	// it must neither open, change nor close anything.
@@ -213,37 +219,38 @@ func evaluateRule(anomaly vehicleAnomalyType, obs vehicleObservation, observedAt
 // memory. Vehicles without an ID are skipped. A vehicle missing from a
 // full-dataset response closes its open episodes; a differential feed's
 // absence changes nothing. A vehicle that is in the response but not among
-// the observations (another agency's vehicle on a shared feed) is left to
-// the entry that observes it.
+// the observations (another source's vehicle on a shared feed) is left to
+// the entry that observes it. Episodes are keyed by feed source, so two
+// sources that share a sanitized feed URL never share an episode.
 func planVehicleAnomalies(open map[vehicleEpisodeKey]*openVehicleEpisode, sightings map[vehicleSightingKey]vehicleSighting, feeds []vehicleFeed, observations []vehicleObservation, threshold time.Duration) vehicleEpisodePlan {
-	feedByURL := make(map[string]vehicleFeed, len(feeds))
+	feedBySource := make(map[string]vehicleFeed, len(feeds))
 	for _, feed := range feeds {
-		feedByURL[feed.feedURL] = feed
+		feedBySource[feed.source] = feed
 	}
 
 	var plan vehicleEpisodePlan
-	type presentKey struct{ feedURL, vehicleID string }
+	type presentKey struct{ source, vehicleID string }
 	present := make(map[presentKey]bool, len(observations))
 	for _, obs := range observations {
-		feed, ok := feedByURL[obs.feedURL]
-		pk := presentKey{obs.feedURL, obs.vehicleID}
+		feed, ok := feedBySource[obs.source]
+		pk := presentKey{source: obs.source, vehicleID: obs.vehicleID}
 		if !ok || obs.vehicleID == "" || present[pk] {
 			continue
 		}
 		present[pk] = true
-		if sighting, ok := sightings[vehicleSightingKey(pk)]; ok && sighting.newerThan(feed.observedAt) {
+		if sighting, ok := sightings[vehicleSightingKey{pk.source, pk.vehicleID}]; ok && sighting.newerThan(feed.observedAt) {
 			continue
 		}
 		for _, anomaly := range vehicleAnomalyTypes {
-			key := vehicleEpisodeKey{feedURL: obs.feedURL, vehicleID: obs.vehicleID, anomaly: anomaly}
+			key := vehicleEpisodeKey{source: obs.source, vehicleID: obs.vehicleID, anomaly: anomaly}
 			planPresentVehicle(&plan, key, open[key], obs, evaluateRule(anomaly, obs, feed.observedAt, threshold))
 		}
 	}
 
 	for key := range open {
-		feed, ok := feedByURL[key.feedURL]
-		pk := presentKey{key.feedURL, key.vehicleID}
-		if ok && closesOnAbsence(feed, sightings[vehicleSightingKey(pk)], key.vehicleID, present[pk]) {
+		feed, ok := feedBySource[key.source]
+		pk := presentKey{source: key.source, vehicleID: key.vehicleID}
+		if ok && closesOnAbsence(feed, sightings[vehicleSightingKey{key.source, key.vehicleID}], key.vehicleID, present[pk]) {
 			plan.closes = append(plan.closes, vehicleEpisodeClose{key: key, reason: closeNotPresentInFull})
 		}
 	}
@@ -253,9 +260,12 @@ func planVehicleAnomalies(open map[vehicleEpisodeKey]*openVehicleEpisode, sighti
 
 // closesOnAbsence reports whether a full-dataset response that lacks the
 // vehicle closes its episodes. The response must come from the source last
-// seen reporting the vehicle, and must not be older than that sighting.
+// seen reporting the vehicle, and must not be older than that sighting. A
+// sighting of unknown source, which is what a restart leaves behind, closes
+// nothing: the source the vehicle was seen on is not known, so absence cannot
+// be attributed to a response.
 func closesOnAbsence(feed vehicleFeed, sighting vehicleSighting, vehicleID string, observed bool) bool {
-	fromItsSource := sighting.sourceKey != "" && sighting.sourceKey == feed.sourceKey
+	fromItsSource := sighting.source != "" && sighting.source == feed.source
 	return feed.fullDataset &&
 		fromItsSource &&
 		!sighting.newerThan(feed.observedAt) &&
@@ -282,8 +292,8 @@ func (p *vehicleEpisodePlan) sort() {
 }
 
 func (k vehicleEpisodeKey) less(other vehicleEpisodeKey) bool {
-	if k.feedURL != other.feedURL {
-		return k.feedURL < other.feedURL
+	if k.source != other.source {
+		return k.source < other.source
 	}
 	if k.vehicleID != other.vehicleID {
 		return k.vehicleID < other.vehicleID

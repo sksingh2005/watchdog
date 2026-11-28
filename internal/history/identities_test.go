@@ -194,7 +194,7 @@ func TestEnsureHelpers_Idempotent(t *testing.T) {
 		if agencyID, err = ensureAgency(ctx, q, serverID, "S", "1", ""); err != nil {
 			return err
 		}
-		endpointID, err = ensureEndpoint(ctx, q, serverID, "S", "https://rt.example/vp.pb")
+		endpointID, err = ensureEndpoint(ctx, q, serverID, "S", "https://rt.example/vp.pb", models.FeedSourceKey("https://rt.example/vp.pb"))
 		return err
 	})
 
@@ -208,10 +208,15 @@ func TestEnsureHelpers_Idempotent(t *testing.T) {
 		ensure ensureFunc
 	}{
 		{
+			// Sources are the full configured feed URLs, so the identity of a
+			// vehicle-position endpoint is the server plus its source; feeds
+			// that differ only by query string are different sources.
 			name: "endpoint", table: "vehicle_position_endpoint",
-			same:  [2]string{"https://feeds.example/positions.pb?key=a", "https://u:p@FEEDS.example/positions.pb"},
+			same:  [2]string{"https://feeds.example/positions.pb", "https://feeds.example/positions.pb"},
 			other: "https://feeds.example/other.pb", empty: "",
-			ensure: func(q *dbgen.Queries, url string) (int64, error) { return ensureEndpoint(ctx, q, serverID, "S", url) },
+			ensure: func(q *dbgen.Queries, url string) (int64, error) {
+				return ensureEndpoint(ctx, q, serverID, "S", url, models.FeedSourceKey(url))
+			},
 		},
 		{
 			name: "static source", table: "static_gtfs_source",

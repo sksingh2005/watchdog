@@ -67,6 +67,11 @@ func (app *Application) recordVehicleHistory(ctx context.Context, server models.
 // and the removed agencies of a base URL that only agency-mode entries still
 // configure. A server-scoped entry records every agency OBA reports, so its
 // base URL keeps all of them.
+//
+// It also closes the open vehicle-anomaly episodes that no configured entry
+// keeps any more, so a server that left the configuration, or a feed that did,
+// cannot keep an episode open until retention (#456). A server-scoped entry
+// records every agency OBA reports, so its base URL keeps all of them.
 func (app *Application) flushRemovedServerHistory(servers []models.ObaServer) {
 	if app.HistoryService == nil {
 		return
@@ -98,6 +103,12 @@ func (app *Application) flushRemovedServerHistory(servers []models.ObaServer) {
 		}
 		cancel()
 	}
+	// Vehicle-anomaly episodes close the same way, against a synthetic
+	// response of the feed that left, with the explicit reason of a server or
+	// feed that left the configuration.
+	ctx, cancel := context.WithTimeout(context.Background(), historyFlushTimeout)
+	app.HistoryService.CloseOpenVehicleEpisodes(ctx, servers)
+	cancel()
 }
 
 // ReconcileHistoryAtStartup closes persisted unmatched-stop episodes whose
@@ -140,6 +151,14 @@ func (app *Application) ReconcileHistoryAtStartup(ctx context.Context, servers [
 		app.HistoryService.ReconcileConfiguredAgencies(ctx, serverByURL[baseURL], keep)
 		cancel()
 	}
+
+	// Close the vehicle-anomaly episodes of feeds that left the configuration
+	// while Watchdog was down, so a restart does not leave them open until
+	// retention. A server-scoped entry records every agency OBA reports, so its
+	// base URL keeps all of them.
+	ctx, cancel := context.WithTimeout(ctx, historyFlushTimeout)
+	app.HistoryService.CloseOpenVehicleEpisodes(ctx, servers)
+	cancel()
 }
 
 // FlushHistory waits for an in-flight collection cycle to finish, then saves

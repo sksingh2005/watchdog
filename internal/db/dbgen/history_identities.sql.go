@@ -184,25 +184,29 @@ func (q *Queries) EnsureVehicleEntity(ctx context.Context, arg EnsureVehicleEnti
 
 const ensureVehiclePositionEndpoint = `-- name: EnsureVehiclePositionEndpoint :one
 WITH inserted AS (
-    INSERT INTO vehicle_position_endpoint (server_id, normalized_vehicle_position_url)
-    VALUES ($1, $2)
-    ON CONFLICT (server_id, normalized_vehicle_position_url) DO NOTHING
+    INSERT INTO vehicle_position_endpoint (server_id, normalized_vehicle_position_url, feed_source_key)
+    VALUES ($1, $2, $3)
+    ON CONFLICT (server_id, feed_source_key) DO NOTHING
     RETURNING endpoint_id
 )
 SELECT endpoint_id FROM inserted
 UNION ALL
 SELECT endpoint_id FROM vehicle_position_endpoint
-WHERE server_id = $1 AND normalized_vehicle_position_url = $2
+WHERE server_id = $1 AND feed_source_key = $3
 LIMIT 1
 `
 
 type EnsureVehiclePositionEndpointParams struct {
 	ServerID                     int64
 	NormalizedVehiclePositionUrl string
+	FeedSourceKey                *string
 }
 
+// The source key is the full configured feed URL, query string included, as a
+// non-secret hash, so feeds that differ only by query string are different
+// endpoints. The server and the source together identify the endpoint.
 func (q *Queries) EnsureVehiclePositionEndpoint(ctx context.Context, arg EnsureVehiclePositionEndpointParams) (int64, error) {
-	row := q.db.QueryRow(ctx, ensureVehiclePositionEndpoint, arg.ServerID, arg.NormalizedVehiclePositionUrl)
+	row := q.db.QueryRow(ctx, ensureVehiclePositionEndpoint, arg.ServerID, arg.NormalizedVehiclePositionUrl, arg.FeedSourceKey)
 	var endpoint_id int64
 	err := row.Scan(&endpoint_id)
 	return endpoint_id, err

@@ -143,16 +143,20 @@ func ensureAgency(ctx context.Context, q *dbgen.Queries, serverID int64, serverN
 	return id, nil
 }
 
-// ensureEndpoint returns the ID of a vehicle-position feed URL on a server.
-func ensureEndpoint(ctx context.Context, q *dbgen.Queries, serverID int64, serverName, vehiclePositionURL string) (int64, error) {
-	feedURL := utils.SanitizeServerURL(vehiclePositionURL)
-	if feedURL == "" {
+// ensureEndpoint returns the ID of a vehicle-position feed source on a
+// server. A source is the full configured feed URL, query string included, as a
+// non-secret hash, so feeds that differ only by query string are different
+// endpoints.
+func ensureEndpoint(ctx context.Context, q *dbgen.Queries, serverID int64, serverName, vehiclePositionURL, feedSourceKey string) (int64, error) {
+	normalized := utils.SanitizeServerURL(vehiclePositionURL)
+	if normalized == "" {
 		return 0, fmt.Errorf("server %q: vehicle-position URL cannot be normalized", serverName)
 	}
 	id, err := retryOnNoRows(func() (int64, error) {
 		return q.EnsureVehiclePositionEndpoint(ctx, dbgen.EnsureVehiclePositionEndpointParams{
 			ServerID:                     serverID,
-			NormalizedVehiclePositionUrl: feedURL,
+			NormalizedVehiclePositionUrl: normalized,
+			FeedSourceKey:                &feedSourceKey,
 		})
 	})
 	if err != nil {

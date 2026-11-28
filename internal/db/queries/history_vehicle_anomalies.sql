@@ -34,6 +34,7 @@ SELECT
     e.vehicle_anomaly_episode_id,
     t.anomaly_code,
     ep.normalized_vehicle_position_url,
+    ep.feed_source_key,
     v.external_vehicle_id,
     latest.trip_id,
     latest.trip_start_date,

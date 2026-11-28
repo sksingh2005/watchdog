@@ -41,16 +41,19 @@ WHERE server_id = @server_id AND external_agency_id = @external_agency_id
 LIMIT 1;
 
 -- name: EnsureVehiclePositionEndpoint :one
+-- The source key is the full configured feed URL, query string included, as a
+-- non-secret hash, so feeds that differ only by query string are different
+-- endpoints. The server and the source together identify the endpoint.
 WITH inserted AS (
-    INSERT INTO vehicle_position_endpoint (server_id, normalized_vehicle_position_url)
-    VALUES (@server_id, @normalized_vehicle_position_url)
-    ON CONFLICT (server_id, normalized_vehicle_position_url) DO NOTHING
+    INSERT INTO vehicle_position_endpoint (server_id, normalized_vehicle_position_url, feed_source_key)
+    VALUES (@server_id, @normalized_vehicle_position_url, @feed_source_key)
+    ON CONFLICT (server_id, feed_source_key) DO NOTHING
     RETURNING endpoint_id
 )
 SELECT endpoint_id FROM inserted
 UNION ALL
 SELECT endpoint_id FROM vehicle_position_endpoint
-WHERE server_id = @server_id AND normalized_vehicle_position_url = @normalized_vehicle_position_url
+WHERE server_id = @server_id AND feed_source_key = @feed_source_key
 LIMIT 1;
 
 -- name: EnsureStaticGTFSSource :one

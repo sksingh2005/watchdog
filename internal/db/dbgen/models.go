@@ -288,6 +288,7 @@ type VehiclePositionEndpoint struct {
 	ServerID                     int64
 	NormalizedVehiclePositionUrl string
 	CreatedAt                    time.Time
+	FeedSourceKey                *string
 }
 
 type VehiclePositionEvidence struct {

@@ -3,6 +3,7 @@ package history
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -23,6 +24,7 @@ const (
 	vehicleAnomalyStep            = "vehicle_anomalies"
 	vehicleAnomalyLoadStep        = "vehicle_anomaly_load"
 	vehicleAnomalyRuleVersionStep = "vehicle_anomaly_rule_versions"
+	vehicleAnomalyFlushStep       = "vehicle_anomaly_flush"
 )
 
 // Evidence roles link evidence to an episode.
@@ -55,9 +57,9 @@ type vehicleFacts struct {
 	// computed for the vehicle this tick, nil when it computed none.
 	computedSpeedMps      *float64
 	speedDiscrepancyRatio *float64
-	// boxVersionID is the bounding_box_version of the box the vehicle was
-	// checked against, read when it was checked. It is nil when no box
-	// applied or the box's version is not recorded.
+	// boxVersionID is the bounding box version the vehicle was checked
+	// against, read when it was checked. It is nil when no box applied or the
+	// box's version is not recorded.
 	boxVersionID *int64
 }
 
@@ -65,6 +67,7 @@ type vehicleFacts struct {
 // change to them, from every entry on the server.
 type serverVehicleEpisodes struct {
 	mu     sync.Mutex
+	server models.ObaServer
 	loaded bool
 	open   map[vehicleEpisodeKey]*openVehicleEpisode
 	// sightings outlives a reload: it is memory-only information the
@@ -74,9 +77,9 @@ type serverVehicleEpisodes struct {
 
 // openVehicleEpisodes holds every server's open episodes, keyed by the
 // sanitized base URL. The database allows one open episode per vehicle and
-// type, and a vehicle belongs to a feed of a server, not to an agency, so
-// every entry on a base URL shares one set: agency-mode entries that share a
-// feed URL, and a server-scoped entry alongside them, see the same episode.
+// type, and a vehicle belongs to a feed source of a server, not to an agency,
+// so every entry on a base URL shares one set: agency-mode entries that share
+// a feed source, and a server-scoped entry alongside them, see the same episode.
 type openVehicleEpisodes struct {
 	mu      sync.Mutex
 	entries map[string]*serverVehicleEpisodes
@@ -88,18 +91,49 @@ func newOpenVehicleEpisodes() *openVehicleEpisodes {
 
 // forServer returns the server's open episodes, creating an unloaded set if
 // needed.
-func (o *openVehicleEpisodes) forServer(baseURL string) *serverVehicleEpisodes {
+func (o *openVehicleEpisodes) forServer(baseURL string, server models.ObaServer) *serverVehicleEpisodes {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	entry, ok := o.entries[baseURL]
 	if !ok {
 		entry = &serverVehicleEpisodes{
+			server:    server,
 			open:      make(map[vehicleEpisodeKey]*openVehicleEpisode),
 			sightings: make(map[vehicleSightingKey]vehicleSighting),
 		}
 		o.entries[baseURL] = entry
 	}
 	return entry
+}
+
+// lookup returns the server's entry without creating one.
+func (o *openVehicleEpisodes) lookup(baseURL string) (*serverVehicleEpisodes, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	entry, ok := o.entries[baseURL]
+	return entry, ok
+}
+
+// remove drops the server's entry and returns it, if there was one.
+func (o *openVehicleEpisodes) remove(baseURL string) (*serverVehicleEpisodes, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	entry, ok := o.entries[baseURL]
+	delete(o.entries, baseURL)
+	return entry, ok
+}
+
+// baseURLs returns the sanitized base URLs holding open episodes, sorted, so
+// closes are written in a deterministic order.
+func (o *openVehicleEpisodes) baseURLs() []string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	urls := make([]string, 0, len(o.entries))
+	for url := range o.entries {
+		urls = append(urls, url)
+	}
+	sort.Strings(urls)
+	return urls
 }
 
 // vehicleRuleVersions holds the anomaly type IDs and the rule version in
@@ -163,7 +197,7 @@ func (h *HistoryService) RecordVehiclePositions(ctx context.Context, server mode
 	ctx, cancel := context.WithTimeout(ctx, writeTimeout)
 	defer cancel()
 
-	entry := h.vehicles.forServer(baseURL)
+	entry := h.vehicles.forServer(baseURL, server)
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
 
@@ -231,14 +265,14 @@ const sightingRetention = 10 * time.Minute
 func noteSightings(entry *serverVehicleEpisodes, feeds []vehicleFeed, observations []vehicleObservation) {
 	observed := make(map[string][]string, len(feeds))
 	for _, obs := range observations {
-		observed[obs.feedURL] = append(observed[obs.feedURL], obs.vehicleID)
+		observed[obs.source] = append(observed[obs.source], obs.vehicleID)
 	}
 	var newest time.Time
 	for _, feed := range feeds {
 		if feed.observedAt.After(newest) {
 			newest = feed.observedAt
 		}
-		ids := observed[feed.feedURL]
+		ids := observed[feed.source]
 		if feed.reportedVehicleIDs != nil {
 			ids = make([]string, 0, len(feed.reportedVehicleIDs))
 			for id := range feed.reportedVehicleIDs {
@@ -246,11 +280,11 @@ func noteSightings(entry *serverVehicleEpisodes, feeds []vehicleFeed, observatio
 			}
 		}
 		for _, id := range ids {
-			key := vehicleSightingKey{feedURL: feed.feedURL, vehicleID: id}
+			key := vehicleSightingKey{source: feed.source, vehicleID: id}
 			if current, ok := entry.sightings[key]; ok && current.newerThan(feed.observedAt) {
 				continue
 			}
-			entry.sightings[key] = vehicleSighting{sourceKey: feed.sourceKey, observedAt: feed.observedAt}
+			entry.sightings[key] = vehicleSighting{source: feed.source, observedAt: feed.observedAt}
 		}
 	}
 	pruneSightings(entry, newest)
@@ -261,7 +295,7 @@ func noteSightings(entry *serverVehicleEpisodes, feeds []vehicleFeed, observatio
 func pruneSightings(entry *serverVehicleEpisodes, now time.Time) {
 	withEpisode := make(map[vehicleSightingKey]bool, len(entry.open))
 	for key := range entry.open {
-		withEpisode[vehicleSightingKey{feedURL: key.feedURL, vehicleID: key.vehicleID}] = true
+		withEpisode[vehicleSightingKey{source: key.source, vehicleID: key.vehicleID}] = true
 	}
 	for key, sighting := range entry.sightings {
 		if !withEpisode[key] && now.Sub(sighting.observedAt) > sightingRetention {
@@ -270,68 +304,16 @@ func pruneSightings(entry *serverVehicleEpisodes, now time.Time) {
 	}
 }
 
-// feedSourceIndex maps each configured vehicle-position feed, by sanitized
-// base URL and feed URL, to the sources configured for it. After a restart
-// an open episode's source is unknown; when exactly one source is configured
-// for its feed URL, that is its source.
-type feedSourceIndex struct {
-	mu      sync.RWMutex
-	sources map[feedSourceIndexKey]map[string]struct{}
-}
-
-type feedSourceIndexKey struct{ baseURL, feedURL string }
-
-func newFeedSourceIndex(servers []models.ObaServer) *feedSourceIndex {
-	index := &feedSourceIndex{}
-	index.update(servers)
-	return index
-}
-
-func (x *feedSourceIndex) update(servers []models.ObaServer) {
-	sources := make(map[feedSourceIndexKey]map[string]struct{})
-	for _, server := range servers {
-		baseURL := utils.SanitizeServerURL(server.ObaBaseURL)
-		for _, feed := range server.GtfsRTFeeds {
-			key := feedSourceIndexKey{baseURL, utils.SanitizeServerURL(feed.VehiclePositionURL)}
-			if sources[key] == nil {
-				sources[key] = make(map[string]struct{})
-			}
-			sources[key][models.FeedSourceKey(feed.VehiclePositionURL)] = struct{}{}
-		}
-	}
-	x.mu.Lock()
-	defer x.mu.Unlock()
-	x.sources = sources
-}
-
-// only returns the one source configured for a feed URL, or false when
-// there are none or several.
-func (x *feedSourceIndex) only(baseURL, feedURL string) (string, bool) {
-	x.mu.RLock()
-	defer x.mu.RUnlock()
-	set := x.sources[feedSourceIndexKey{baseURL, feedURL}]
-	if len(set) != 1 {
-		return "", false
-	}
-	for source := range set {
-		return source, true
-	}
-	return "", false
-}
-
 // seedSighting gives a loaded episode's vehicle a sighting from its newest
-// evidence, unless memory already holds a newer one. The source is known only
-// when one configured feed maps to the feed URL.
-func seedSighting(entry *serverVehicleEpisodes, key vehicleEpisodeKey, observedAt time.Time, sources *feedSourceIndex, baseURL string) {
-	sightingKey := vehicleSightingKey{feedURL: key.feedURL, vehicleID: key.vehicleID}
+// evidence, unless memory already holds a newer one. The source is the one the
+// episode's endpoint reported, and is empty for legacy rows that predate
+// source-scoped endpoints, where it stays unknown.
+func seedSighting(entry *serverVehicleEpisodes, key vehicleEpisodeKey, observedAt time.Time) {
+	sightingKey := vehicleSightingKey{source: key.source, vehicleID: key.vehicleID}
 	if current, ok := entry.sightings[sightingKey]; ok && !current.observedAt.Before(observedAt) {
 		return
 	}
-	sighting := vehicleSighting{observedAt: observedAt}
-	if source, ok := sources.only(baseURL, key.feedURL); ok {
-		sighting.sourceKey = source
-	}
-	entry.sightings[sightingKey] = sighting
+	entry.sightings[sightingKey] = vehicleSighting{source: key.source, observedAt: observedAt}
 }
 
 // loadOpenVehicleEpisodes replaces entry's open episodes with the ones in the
@@ -345,13 +327,17 @@ func (h *HistoryService) loadOpenVehicleEpisodes(ctx context.Context, server mod
 	}
 	entry.open = make(map[vehicleEpisodeKey]*openVehicleEpisode, len(rows))
 	for _, row := range rows {
+		source := ""
+		if row.FeedSourceKey != nil {
+			source = *row.FeedSourceKey
+		}
 		key := vehicleEpisodeKey{
-			feedURL:   row.NormalizedVehiclePositionUrl,
+			source:    source,
 			vehicleID: row.ExternalVehicleID,
 			anomaly:   vehicleAnomalyType(row.AnomalyCode),
 		}
 		episode := &openVehicleEpisode{episodeID: row.VehicleAnomalyEpisodeID}
-		seedSighting(entry, key, row.ObservedAt, h.feedSources, baseURL)
+		seedSighting(entry, key, row.ObservedAt)
 		if row.TripID != nil {
 			episode.tripID = *row.TripID
 		}
@@ -434,29 +420,29 @@ func (h *HistoryService) ensureRuleVersions(ctx context.Context, server models.O
 // ID.
 func vehicleObservations(server models.ObaServer, snapshot *models.RealtimeData, judges vehicleJudges) ([]vehicleFeed, []vehicleObservation) {
 	feeds := make([]vehicleFeed, 0, len(snapshot.Feeds))
-	feedURLs := make(map[string]string, len(snapshot.Feeds))
+	sourceByFeedID := make(map[string]string, len(snapshot.Feeds))
 	for _, feed := range snapshot.Feeds {
 		feeds = append(feeds, vehicleFeed{
 			feedURL:            feed.FeedURL,
+			source:             feed.SourceKey,
 			observedAt:         snapshot.ObservationAt,
 			fullDataset:        feed.FullDataset,
 			sourceTimestamp:    feed.SourceTimestamp,
 			payloadHash:        feed.PayloadHash,
-			sourceKey:          feed.SourceKey,
 			reportedVehicleIDs: feed.ReportedVehicleIDs,
 		})
-		feedURLs[feed.FeedID] = feed.FeedURL
+		sourceByFeedID[feed.FeedID] = feed.SourceKey
 	}
 
 	observations := make([]vehicleObservation, 0, len(snapshot.Vehicles))
 	for _, realtimeVehicle := range snapshot.Vehicles {
 		vehicle := realtimeVehicle.Vehicle
-		feedURL, ok := feedURLs[realtimeVehicle.FeedID]
+		source, ok := sourceByFeedID[realtimeVehicle.FeedID]
 		vehicleID := vehicle.GetID().ID
 		if !ok || vehicleID == "" || !vehicle.IsEntityInMessage {
 			continue
 		}
-		observations = append(observations, observeVehicle(server, feedURL, realtimeVehicle.FeedID, vehicle, judges))
+		observations = append(observations, observeVehicle(server, source, realtimeVehicle.FeedID, vehicle, judges))
 	}
 	return feeds, observations
 }
@@ -464,12 +450,12 @@ func vehicleObservations(server models.ObaServer, snapshot *models.RealtimeData,
 // observeVehicle judges one vehicle the way trackInvalidVehiclesAndStoppedOutOfBounds
 // does: coordinates first, then the agency box when the vehicle is
 // attributed and its agency has one, otherwise the server box.
-func observeVehicle(server models.ObaServer, feedURL, feedID string, vehicle remoteGtfs.Vehicle, judges vehicleJudges) vehicleObservation {
+func observeVehicle(server models.ObaServer, source, feedID string, vehicle remoteGtfs.Vehicle, judges vehicleJudges) vehicleObservation {
 	lat, lon, positionReason := geo.VehiclePosition(vehicle)
 	agency, attributionReason := judges.attributor.Attribute(vehicle)
 
 	obs := vehicleObservation{
-		feedURL:        feedURL,
+		source:         source,
 		vehicleID:      vehicle.GetID().ID,
 		sourceTime:     vehicle.Timestamp,
 		positionReason: positionReason,
@@ -534,7 +520,7 @@ type vehicleJudges struct {
 // vehicleEvidenceKey identifies the one evidence row a vehicle gets per feed
 // response, shared by every episode that tick links to it.
 type vehicleEvidenceKey struct {
-	feedURL   string
+	source    string
 	vehicleID string
 }
 
@@ -579,7 +565,7 @@ func (h *HistoryService) recordVehicleEpisodeChanges(ctx context.Context, q *dbg
 		staticVersionID: staticVersionID,
 	}
 	for _, feed := range feeds {
-		w.feeds[feed.feedURL] = feed
+		w.feeds[feed.source] = feed
 	}
 
 	opened := make(map[vehicleEpisodeKey]*openVehicleEpisode, len(plan.opens))
@@ -609,7 +595,7 @@ func (p vehicleEpisodePlan) boxEvidence() map[vehicleEvidenceKey]bool {
 	needs := make(map[vehicleEvidenceKey]bool)
 	mark := func(key vehicleEpisodeKey) {
 		if key.anomaly == anomalyStoppedOutOfBounds {
-			needs[vehicleEvidenceKey{key.feedURL, key.vehicleID}] = true
+			needs[vehicleEvidenceKey{source: key.source, vehicleID: key.vehicleID}] = true
 		}
 	}
 	for _, o := range p.opens {
@@ -628,11 +614,11 @@ func (p vehicleEpisodePlan) boxEvidence() map[vehicleEvidenceKey]bool {
 
 // open inserts an episode and links its opening evidence.
 func (w *vehicleTickWriter) open(ctx context.Context, o vehicleEpisodeOpen) (*openVehicleEpisode, error) {
-	responseID, err := w.response(ctx, o.key.feedURL)
+	responseID, err := w.response(ctx, o.key.source)
 	if err != nil {
 		return nil, err
 	}
-	vehicleID, err := w.vehicle(ctx, o.key.feedURL, o.key.vehicleID)
+	vehicleID, err := w.vehicle(ctx, o.key.source, o.key.vehicleID)
 	if err != nil {
 		return nil, err
 	}
@@ -658,7 +644,7 @@ func (w *vehicleTickWriter) open(ctx context.Context, o vehicleEpisodeOpen) (*op
 // close closes an episode and, when the vehicle was present, links its
 // resolution evidence.
 func (w *vehicleTickWriter) close(ctx context.Context, episodeID int64, c vehicleEpisodeClose) error {
-	responseID, err := w.response(ctx, c.key.feedURL)
+	responseID, err := w.response(ctx, c.key.source)
 	if err != nil {
 		return err
 	}
@@ -698,15 +684,15 @@ func (w *vehicleTickWriter) link(ctx context.Context, episodeID int64, key vehic
 
 // response returns the feed's vehicle_position_response for this tick,
 // inserting it the first time. Only feeds with a change get one.
-func (w *vehicleTickWriter) response(ctx context.Context, feedURL string) (int64, error) {
-	if id, ok := w.responses[feedURL]; ok {
+func (w *vehicleTickWriter) response(ctx context.Context, source string) (int64, error) {
+	if id, ok := w.responses[source]; ok {
 		return id, nil
 	}
-	endpointID, err := w.endpoint(ctx, feedURL)
+	endpointID, err := w.endpoint(ctx, source)
 	if err != nil {
 		return 0, err
 	}
-	feed := w.feeds[feedURL]
+	feed := w.feeds[source]
 	incrementality := gtfsrt.FeedHeader_DIFFERENTIAL.String()
 	if feed.fullDataset {
 		incrementality = gtfsrt.FeedHeader_FULL_DATASET.String()
@@ -721,28 +707,32 @@ func (w *vehicleTickWriter) response(ctx context.Context, feedURL string) (int64
 	if err != nil {
 		return 0, fmt.Errorf("server %q: insert vehicle-position response: %w", w.server.ServerName, err)
 	}
-	w.responses[feedURL] = id
+	w.responses[source] = id
 	return id, nil
 }
 
-func (w *vehicleTickWriter) endpoint(ctx context.Context, feedURL string) (int64, error) {
-	if id, ok := w.endpoints[feedURL]; ok {
+func (w *vehicleTickWriter) endpoint(ctx context.Context, source string) (int64, error) {
+	if id, ok := w.endpoints[source]; ok {
 		return id, nil
 	}
-	id, err := ensureEndpoint(ctx, w.q, w.serverID, w.server.ServerName, feedURL)
+	feed, ok := w.feeds[source]
+	if !ok {
+		return 0, fmt.Errorf("server %q: no vehicle feed for source %q", w.server.ServerName, source)
+	}
+	id, err := ensureEndpoint(ctx, w.q, w.serverID, w.server.ServerName, feed.feedURL, feed.source)
 	if err != nil {
 		return 0, err
 	}
-	w.endpoints[feedURL] = id
+	w.endpoints[source] = id
 	return id, nil
 }
 
-func (w *vehicleTickWriter) vehicle(ctx context.Context, feedURL, vehicleID string) (int64, error) {
-	key := vehicleEvidenceKey{feedURL, vehicleID}
+func (w *vehicleTickWriter) vehicle(ctx context.Context, source, vehicleID string) (int64, error) {
+	key := vehicleEvidenceKey{source: source, vehicleID: vehicleID}
 	if id, ok := w.vehicles[key]; ok {
 		return id, nil
 	}
-	endpointID, err := w.endpoint(ctx, feedURL)
+	endpointID, err := w.endpoint(ctx, source)
 	if err != nil {
 		return 0, err
 	}
@@ -769,19 +759,19 @@ func (w *vehicleTickWriter) agency(ctx context.Context, agency models.ObaServer)
 // evidenceFor returns the vehicle's evidence row for this tick, inserting it
 // the first time.
 func (w *vehicleTickWriter) evidenceFor(ctx context.Context, obs vehicleObservation) (int64, error) {
-	key := vehicleEvidenceKey{obs.feedURL, obs.vehicleID}
+	key := vehicleEvidenceKey{source: obs.source, vehicleID: obs.vehicleID}
 	if id, ok := w.evidence[key]; ok {
 		return id, nil
 	}
-	responseID, err := w.response(ctx, obs.feedURL)
+	responseID, err := w.response(ctx, obs.source)
 	if err != nil {
 		return 0, err
 	}
-	vehicleID, err := w.vehicle(ctx, obs.feedURL, obs.vehicleID)
+	vehicleID, err := w.vehicle(ctx, obs.source, obs.vehicleID)
 	if err != nil {
 		return 0, err
 	}
-	params := evidenceParams(obs, w.feeds[obs.feedURL].observedAt, w.h.scheduleStore())
+	params := evidenceParams(obs, w.feeds[obs.source].observedAt, w.h.scheduleStore())
 	params.VehiclePositionResponseID = responseID
 	params.VehicleEntityID = &vehicleID
 	params.GtfsStaticVersionID = w.staticVersionID
@@ -906,4 +896,183 @@ func nonEmpty(s string) *string {
 		return nil
 	}
 	return &s
+}
+
+// vehicleDeparture is one open episode closed because its server or feed left
+// the configuration.
+type vehicleDeparture struct {
+	episodeID int64
+	key       vehicleEpisodeKey
+}
+
+// CloseOpenVehicleEpisodes closes the open vehicle-anomaly episodes whose
+// server or feed is no longer configured, and drops the memory of the servers
+// they were held under, so an episode cannot stay open until retention. It
+// serves configuration refreshes (app.OnConfigUpdated) and the startup
+// reconcile alike: a refresh closes the feeds that left, and a restart closes
+// the feeds of configured servers that were removed while Watchdog was down.
+// It returns whether any episode was closed.
+func (h *HistoryService) CloseOpenVehicleEpisodes(ctx context.Context, servers []models.ObaServer) bool {
+	if h == nil || h.pool == nil || h.vehicles == nil {
+		return false
+	}
+	// baseURL → the feed sources the current configuration still fetches, and
+	// the base URLs that are configured at all. A base URL no configured entry
+	// names any more has no sources, so its open episodes are all departures.
+	configured := make(map[string]map[string]struct{})
+	serverScoped := make(map[string]bool)
+	for _, server := range servers {
+		baseURL := utils.SanitizeServerURL(server.ObaBaseURL)
+		if baseURL == "" {
+			continue
+		}
+		if server.IsServerScoped() {
+			// A server-scoped entry records every agency OBA reports, so no
+			// open episode of it can be attributed to a feed that left.
+			serverScoped[baseURL] = true
+			continue
+		}
+		sources := configured[baseURL]
+		if sources == nil {
+			sources = make(map[string]struct{})
+			configured[baseURL] = sources
+		}
+		for _, feed := range server.GtfsRTFeeds {
+			sources[models.FeedSourceKey(feed.VehiclePositionURL)] = struct{}{}
+		}
+	}
+	closed := false
+	for _, baseURL := range h.vehicles.baseURLs() {
+		if serverScoped[baseURL] {
+			continue
+		}
+		keep := make(map[string]struct{})
+		if sources, ok := configured[baseURL]; ok {
+			keep = sources
+		}
+		entry, ok := h.vehicles.lookup(baseURL)
+		if !ok {
+			continue
+		}
+		if h.closeOpenVehicleEpisodes(ctx, entry, keep) {
+			closed = true
+		}
+	}
+	// Configured servers that this process has not polled yet (a restart) load
+	// their open episodes and close the feeds that left while Watchdog was down.
+	for _, server := range servers {
+		baseURL := utils.SanitizeServerURL(server.ObaBaseURL)
+		if baseURL == "" || server.IsServerScoped() {
+			continue
+		}
+		entry, ok := h.vehicles.lookup(baseURL)
+		if !ok {
+			entry = h.vehicles.forServer(baseURL, server)
+		}
+		if !entry.loaded && !h.loadOpenVehicleEpisodes(ctx, server, baseURL, entry) {
+			continue
+		}
+		keep := make(map[string]struct{})
+		if sources, ok := configured[baseURL]; ok {
+			keep = sources
+		}
+		if h.closeOpenVehicleEpisodes(ctx, entry, keep) {
+			closed = true
+		}
+	}
+	return closed
+}
+
+// closeOpenVehicleEpisodes closes entry's open episodes whose feed source is
+// not in keep, then drops the closed ones from memory. A nil keep closes every
+// open episode of the server, which is what a server that left the
+// configuration needs.
+func (h *HistoryService) closeOpenVehicleEpisodes(ctx context.Context, entry *serverVehicleEpisodes, keep map[string]struct{}) bool {
+	entry.mu.Lock()
+	departures := collectVehicleDepartures(entry.open, keep)
+	entry.mu.Unlock()
+	if len(departures) == 0 {
+		return false
+	}
+	if !h.closeDepartedVehicleEpisodes(ctx, entry.server, departures...) {
+		// The episodes stay in memory when the write fails, so the next
+		// configuration update retries them.
+		return false
+	}
+	entry.mu.Lock()
+	for _, departure := range departures {
+		delete(entry.open, departure.key)
+	}
+	empty := len(entry.open) == 0
+	if empty {
+		h.vehicles.remove(utils.SanitizeServerURL(entry.server.ObaBaseURL))
+	}
+	entry.mu.Unlock()
+	return true
+}
+
+// collectVehicleDepartures gathers the open episodes whose source is not in
+// keep. A nil or empty keep means every open episode is a departure.
+func collectVehicleDepartures(open map[vehicleEpisodeKey]*openVehicleEpisode, keep map[string]struct{}) []vehicleDeparture {
+	var departures []vehicleDeparture
+	for key, episode := range open {
+		if len(keep) > 0 {
+			if _, ok := keep[key.source]; ok {
+				continue
+			}
+		}
+		departures = append(departures, vehicleDeparture{episodeID: episode.episodeID, key: key})
+	}
+	sort.Slice(departures, func(i, j int) bool { return departures[i].key.less(departures[j].key) })
+	return departures
+}
+
+// closeDepartedVehicleEpisodes closes the given episodes against a synthetic
+// response of the feed that left the configuration, with the explicit close
+// reason of a server or feed that left, and reports whether the write
+// committed. The trigger requires the closing response to come from the
+// episode's own endpoint and to be observed at or after its opening response;
+// a synthetic response satisfies both, because the feed is gone. The episodes
+// leave memory through the caller once this write commits.
+func (h *HistoryService) closeDepartedVehicleEpisodes(ctx context.Context, server models.ObaServer, departures ...vehicleDeparture) bool {
+	if len(departures) == 0 {
+		return true
+	}
+	return h.write(ctx, vehicleAnomalyFlushStep, serverTags(server), func(q *dbgen.Queries) error {
+		for _, departure := range departures {
+			if err := closeVehicleDeparture(ctx, q, server, departure); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// closeVehicleDeparture closes one episode whose server or feed left the
+// configuration, against a synthetic response of the feed that was open.
+func closeVehicleDeparture(ctx context.Context, q *dbgen.Queries, server models.ObaServer, departure vehicleDeparture) error {
+	episode, err := q.GetVehicleAnomalyEpisode(ctx, departure.episodeID)
+	if err != nil {
+		return fmt.Errorf("server %q: load vehicle-anomaly episode %d: %w", server.ServerName, departure.episodeID, err)
+	}
+	closingID, err := q.InsertVehiclePositionResponse(ctx, dbgen.InsertVehiclePositionResponseParams{
+		EndpointID:     episode.VehicleAnomalyEpisodeView.EndpointID,
+		ObservedAt:     time.Now().UTC(),
+		Incrementality: gtfsrt.FeedHeader_FULL_DATASET.String(),
+	})
+	if err != nil {
+		return fmt.Errorf("server %q: insert closing response of vehicle-anomaly episode %d: %w", server.ServerName, departure.episodeID, err)
+	}
+	rows, err := q.CloseVehicleAnomalyEpisode(ctx, dbgen.CloseVehicleAnomalyEpisodeParams{
+		ClosingResponseID:       closingID,
+		CloseReason:             string(closeFeedRemoved),
+		VehicleAnomalyEpisodeID: departure.episodeID,
+	})
+	if err != nil {
+		return fmt.Errorf("server %q: close vehicle-anomaly episode %d: %w", server.ServerName, departure.episodeID, err)
+	}
+	if rows != 1 {
+		return fmt.Errorf("server %q: close vehicle-anomaly episode %d: not open", server.ServerName, departure.episodeID)
+	}
+	return nil
 }

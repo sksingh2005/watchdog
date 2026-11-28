@@ -601,13 +601,13 @@ func TestRecordVehiclePositions_PrunesOldSightings(t *testing.T) {
 	later := vehicleT0.Add(sightingRetention + time.Minute)
 	recordVehicles(h, ctx, vehicleServer, vehicleSnapshot(later, testVehicle("bus-2", later)))
 
-	entry := h.vehicles.forServer(utils.SanitizeServerURL(vehicleServer.ObaBaseURL))
+	entry := h.vehicles.forServer(utils.SanitizeServerURL(vehicleServer.ObaBaseURL), vehicleServer)
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
-	if _, ok := entry.sightings[vehicleSightingKey{feedURL: vehicleFeedURL, vehicleID: "bus-1"}]; ok {
+	if _, ok := entry.sightings[vehicleSightingKey{source: models.FeedSourceKey(vehicleFeedURL), vehicleID: "bus-1"}]; ok {
 		t.Fatal("kept a sighting older than sightingRetention with no open episode")
 	}
-	if _, ok := entry.sightings[vehicleSightingKey{feedURL: vehicleFeedURL, vehicleID: "bus-2"}]; !ok {
+	if _, ok := entry.sightings[vehicleSightingKey{source: models.FeedSourceKey(vehicleFeedURL), vehicleID: "bus-2"}]; !ok {
 		t.Fatal("dropped a current sighting")
 	}
 }
